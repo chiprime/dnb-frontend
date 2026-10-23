@@ -2,40 +2,122 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
+import { isAxiosError } from "axios";
 import axiosInstance from "@/lib/config/axios.config";
 import { useStellar } from "@/components/stellar/StellarProvider";
 import { persistSession } from "@/hooks/useAuth";
+import { User } from "@/types/api";
 
 const CHALLENGE_PATH = "/api/auth/stellar/challenge";
 const VERIFY_PATH = "/api/auth/stellar/verify";
 
-const isModalClosedError = (error: any): boolean => // TODO(types): Error shape from wallet selection
-  error?.code === -1 ||
-  (typeof error?.message === "string" &&
-    /closed|cancel(l)?ed|reject(ed)?/i.test(error.message));
+// ---------------------------------------------------------------------------
+// SEP-10 payload types (#514)
+// ---------------------------------------------------------------------------
 
-const isExpiredChallengeError = (error: any): boolean => { // TODO(types): Axios error from challenge
-  const message =
-    error?.response?.data?.message ||
-    error?.response?.data?.error ||
-    error?.message ||
-    "";
-  return /expir|time.?bound|challenge.*(invalid|expired)/i.test(
-    String(message)
+/** Response payload of `GET /api/auth/stellar/challenge?account=<address>`. */
+export interface StellarChallengePayload {
+  transaction?: string;
+  networkPassphrase?: string;
+  /** snake_case alias accepted from some API versions. */
+  network_passphrase?: string;
+}
+
+export interface StellarChallenge {
+  transaction: string;
+  networkPassphrase: string;
+}
+
+/** Successful SEP-10 verification — the backend minted a session token. */
+export interface StellarVerifySuccess {
+  token: string;
+  user: User;
+}
+
+/** SEP-10 verification for a wallet that is not linked to a Deen Bridge account yet. */
+export interface StellarVerifyUnregistered {
+  registered: false;
+  account?: string;
+}
+
+export type StellarVerifyResponse = StellarVerifySuccess | StellarVerifyUnregistered;
+
+/** `loginWithStellar` resolves to the session user, or an unregistered marker. */
+export interface UnregisteredWalletResult {
+  unregistered: true;
+  account?: string;
+}
+
+export type StellarLoginResult = User | UnregisteredWalletResult | null;
+
+// ---------------------------------------------------------------------------
+// Error helpers — caught errors arrive as `unknown` and are narrowed before use.
+// ---------------------------------------------------------------------------
+
+const getErrorMessage = (error: unknown): string => {
+  if (isAxiosError(error)) {
+    const data = error.response?.data as
+      | { message?: string; error?: string }
+      | undefined;
+    return data?.message || data?.error || error.message || "";
+  }
+  if (typeof error === "object" && error !== null) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string") return message;
+  }
+  return "";
+};
+
+const getErrorStatus = (error: unknown): number | undefined => {
+  if (isAxiosError(error)) {
+    return error.response?.status;
+  }
+  if (typeof error === "object" && error !== null) {
+    const response = (error as { response?: { status?: unknown } }).response;
+    const status = response?.status;
+    if (typeof status === "number") {
+      return status;
+    }
+  }
+  return undefined;
+};
+
+const isModalClosedError = (error: unknown): boolean => {
+  if (typeof error !== "object" || error === null) return false;
+  const { code, message } = error as { code?: string | number; message?: string };
+  return (
+    code === -1 ||
+    (typeof message === "string" && /closed|cancel(l)?ed|reject(ed)?/i.test(message))
   );
 };
 
-const isUnregisteredWallet = (error: any, data?: any): boolean => { // TODO(types): Response data/error shape
-  if (data && data.registered === false) return true;
-  const status = error?.response?.status;
+const isExpiredChallengeError = (error: unknown): boolean => {
+  const message = getErrorMessage(error);
+  return /expir|time.?bound|challenge.*(invalid|expired)/i.test(message);
+};
+
+const isUnregisteredWalletResponse = (
+  data: unknown
+): data is StellarVerifyUnregistered => {
+  if (typeof data !== "object" || data === null) return false;
+  const registered = (data as { registered?: unknown }).registered;
+  return registered === false;
+};
+
+const isUnregisteredWallet = (error: unknown, data?: unknown): boolean => {
+  if (data && typeof data === "object" && "registered" in data) {
+    const registered = (data as { registered?: unknown }).registered;
+    if (registered === false) return true;
+  }
+  const status = getErrorStatus(error);
   return status === 404 || status === 409;
 };
 
-const getNetworkPassphrase = (payload: any = {}): string => // TODO(types): Challenge payload
-  payload.networkPassphrase || payload.network_passphrase;
+const getNetworkPassphrase = (payload: StellarChallengePayload = {}): string =>
+  payload.networkPassphrase || payload.network_passphrase || "";
 
-const fetchChallenge = async (account: string): Promise<{ transaction: string; networkPassphrase: string }> => {
-  const res = await axiosInstance.get(CHALLENGE_PATH, {
+const fetchChallenge = async (account: string): Promise<StellarChallenge> => {
+  const res = await axiosInstance.get<StellarChallengePayload>(CHALLENGE_PATH, {
     params: { account },
   });
   const transaction = res.data?.transaction;
@@ -48,15 +130,17 @@ const fetchChallenge = async (account: string): Promise<{ transaction: string; n
   return { transaction, networkPassphrase };
 };
 
-const verifyChallenge = async (signedXdr: string): Promise<any> => { // TODO(types): SEP-10 verify response
-  const res = await axiosInstance.post(VERIFY_PATH, {
+const verifyChallenge = async (
+  signedXdr: string
+): Promise<StellarVerifyResponse> => {
+  const res = await axiosInstance.post<StellarVerifyResponse>(VERIFY_PATH, {
     transaction: signedXdr,
   });
   return res.data;
 };
 
 export interface UseStellarAuthResult {
-  loginWithStellar: () => Promise<any | null>; // TODO(types): User or unregistered indicator
+  loginWithStellar: () => Promise<StellarLoginResult>;
   isPending: boolean;
   stellarAuthAvailable: boolean | null;
   availabilityChecked: boolean;
@@ -85,9 +169,9 @@ export function useStellarAuth(): UseStellarAuthResult {
         } else {
           setStellarAuthAvailable(true);
         }
-      } catch (error: any) { // TODO(types): Network error from probe
+      } catch (error: unknown) {
         if (cancelled) return;
-        const status = error?.response?.status;
+        const status = getErrorStatus(error);
         if (status === 404 || status === 503) {
           setStellarAuthAvailable(false);
         } else if (status) {
@@ -106,7 +190,7 @@ export function useStellarAuth(): UseStellarAuthResult {
     };
   }, []);
 
-  const loginWithStellar = useCallback(async () => {
+  const loginWithStellar = useCallback(async (): Promise<StellarLoginResult> => {
     if (!kitInitialized) {
       toast.error("Wallet kit not initialized. Please refresh the page.");
       return null;
@@ -124,7 +208,7 @@ export function useStellarAuth(): UseStellarAuthResult {
     try {
       const address = await selectWallet();
 
-      const attemptVerify = async (allowRetry: boolean): Promise<any> => { // TODO(types): Verify challenge response payload
+      const attemptVerify = async (allowRetry: boolean): Promise<StellarVerifyResponse> => {
         const { transaction, networkPassphrase } = await fetchChallenge(address);
         const signedXdr = await signTransaction(transaction, networkPassphrase);
 
@@ -140,14 +224,14 @@ export function useStellarAuth(): UseStellarAuthResult {
 
       const data = await attemptVerify(true);
 
-      if (data?.registered === false) {
+      if (isUnregisteredWalletResponse(data)) {
         toast.error(
           "This wallet is not linked to a Deen Bridge account yet. Sign up with email, then link your wallet from the dashboard."
         );
-        return { unregistered: true, account: data.accountProven || address };
+        return { unregistered: true, account: data.account || address };
       }
 
-      const { token, user } = data || {};
+      const { token, user } = data;
       if (!token || !user) {
         throw new Error("Invalid verify response from server");
       }
@@ -155,7 +239,7 @@ export function useStellarAuth(): UseStellarAuthResult {
       persistSession(token, user);
       toast.success("Signed in with Stellar");
       return user;
-    } catch (error: any) { // TODO(types): Error from SEP-10 login
+    } catch (error: unknown) {
       if (isModalClosedError(error)) {
         toast.message("Wallet connection cancelled");
         return null;
@@ -168,7 +252,8 @@ export function useStellarAuth(): UseStellarAuthResult {
         return { unregistered: true };
       }
 
-      if (error?.response?.status === 503 || error?.response?.status === 404) {
+      const status = getErrorStatus(error);
+      if (status === 503 || status === 404) {
         setStellarAuthAvailable(false);
         toast.error(
           "Sign in with Stellar is not available on the server yet. Please use email login."
@@ -176,11 +261,7 @@ export function useStellarAuth(): UseStellarAuthResult {
         return null;
       }
 
-      const message =
-        error?.response?.data?.message ||
-        error?.response?.data?.error ||
-        error?.message ||
-        "Sign in with Stellar failed. Please try again.";
+      const message = getErrorMessage(error) || "Sign in with Stellar failed. Please try again.";
 
       console.error("Stellar auth error:", error);
       toast.error(message);
